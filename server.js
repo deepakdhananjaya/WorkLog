@@ -1,10 +1,8 @@
 const http = require("node:http");
 const fs = require("node:fs");
 const path = require("node:path");
-const os = require("node:os");
 const crypto = require("node:crypto");
-const childProcess = require("node:child_process");
-const { DatabaseSync } = require("node:sqlite");
+const Database = require("better-sqlite3");
 
 const HOST = "127.0.0.1";
 const PORT = Number(process.env.PORT || 3000);
@@ -13,14 +11,11 @@ const DATA_DIR = path.join(__dirname, "data");
 const DB_PATH = path.join(DATA_DIR, "invoiceflow.sqlite");
 const BUSINESS_PROFILE_PATH = path.join(__dirname, "business-profile.json");
 const SESSION_COOKIE = "invoiceflow_session";
-const CHROME_BIN = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
-
 const BUSINESS_PROFILE = JSON.parse(fs.readFileSync(BUSINESS_PROFILE_PATH, "utf8"));
-const PUBLIC_STYLES = fs.readFileSync(path.join(PUBLIC_DIR, "styles.css"), "utf8");
 
 fs.mkdirSync(DATA_DIR, { recursive: true });
 
-const db = new DatabaseSync(DB_PATH);
+const db = new Database(DB_PATH);
 db.exec(`
   PRAGMA foreign_keys = ON;
 

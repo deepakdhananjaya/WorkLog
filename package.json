@@ -3,6 +3,9 @@
   "version": "1.0.0",
   "private": true,
   "description": "Full-stack invoice and payment tracking platform",
+  "dependencies": {
+    "better-sqlite3": "^11.10.0"
+  },
   "scripts": {
     "start": "node server.js"
   }
