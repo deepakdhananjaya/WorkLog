@@ -1,0 +1,22 @@
+{
+  "companyName": "AgileSattva Consulting LLP",
+  "addressLines": [
+    "B-39, Good Earth Maharl Park Patterns, Kamibpura,",
+    "(Landmark: near by Tulsi Waldorf Kindergarten),",
+    "Bengaluru, Karnataka, India - 560074"
+  ],
+  "gstin": "29ABEFA4086F1ZE",
+  "pan": "ABEFA4086F",
+  "countryOfSupply": "India",
+  "stateName": "Karnataka",
+  "stateCode": "29",
+  "bankDetails": {
+    "accountName": "AGILESATTVA CONSULTING LLP",
+    "accountNumber": "50200013101418",
+    "ifsc": "HDFC0004460",
+    "accountType": "Savings",
+    "bankName": "HDFC BANK"
+  },
+  "signatoryName": "Deepak Dhananjaya",
+  "brandTagline": "Essence of being agile"
+}

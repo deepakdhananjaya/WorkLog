@@ -1,0 +1,9 @@
+{
+  "name": "invoiceflow-platform",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Full-stack invoice and payment tracking platform",
+  "scripts": {
+    "start": "node server.js"
+  }
+}
