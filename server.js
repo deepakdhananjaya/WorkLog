@@ -255,12 +255,12 @@ const statements = {
   getMonthlyMetrics: db.prepare(`
     SELECT
       (SELECT COUNT(*) FROM session_logs WHERE substr(session_date, 1, 7) = ?) AS session_count,
-      (SELECT COALESCE(SUM(fee_amount), 0) FROM session_logs WHERE substr(session_date, 1, 7) = ?) AS billed_from_sessions,
-      (SELECT COALESCE(SUM(amount), 0) FROM payments WHERE substr(payment_date, 1, 7) = ?) AS collected_from_payments,
-      (SELECT COALESCE(SUM(invoices.amount - COALESCE(payment_totals.paid_amount, 0)), 0)
+      (SELECT ROUND(COALESCE(SUM(fee_amount), 0), 2) FROM session_logs WHERE substr(session_date, 1, 7) = ?) AS billed_from_sessions,
+      (SELECT ROUND(COALESCE(SUM(amount), 0), 2) FROM payments WHERE substr(payment_date, 1, 7) = ?) AS collected_from_payments,
+      (SELECT ROUND(COALESCE(SUM(invoices.amount - COALESCE(payment_totals.paid_amount, 0)), 0), 2)
         FROM invoices
         LEFT JOIN (
-          SELECT invoice_id, SUM(amount) AS paid_amount
+          SELECT invoice_id, ROUND(SUM(amount), 2) AS paid_amount
           FROM payments
           GROUP BY invoice_id
         ) AS payment_totals ON payment_totals.invoice_id = invoices.id
@@ -273,15 +273,15 @@ const statements = {
       clients.name AS client_name,
       (SELECT COUNT(*) FROM session_logs WHERE session_logs.client_id = clients.id AND substr(session_logs.session_date, 1, 7) = ?) AS session_count,
       (SELECT COUNT(*) FROM invoices WHERE invoices.client_id = clients.id) AS invoice_count,
-      (SELECT COALESCE(SUM(invoices.amount), 0) FROM invoices WHERE invoices.client_id = clients.id AND substr(invoices.issue_date, 1, 7) = ?) AS invoiced_total,
-      (SELECT COALESCE(SUM(payments.amount), 0)
+      (SELECT ROUND(COALESCE(SUM(invoices.amount), 0), 2) FROM invoices WHERE invoices.client_id = clients.id AND substr(invoices.issue_date, 1, 7) = ?) AS invoiced_total,
+      (SELECT ROUND(COALESCE(SUM(payments.amount), 0), 2)
         FROM payments
         JOIN invoices ON invoices.id = payments.invoice_id
         WHERE invoices.client_id = clients.id AND substr(payments.payment_date, 1, 7) = ?) AS collected_total,
-      (SELECT COALESCE(SUM(invoices.amount - COALESCE(payment_totals.paid_amount, 0)), 0)
+      (SELECT ROUND(COALESCE(SUM(invoices.amount - COALESCE(payment_totals.paid_amount, 0)), 0), 2)
         FROM invoices
         LEFT JOIN (
-          SELECT invoice_id, SUM(amount) AS paid_amount
+          SELECT invoice_id, ROUND(SUM(amount), 2) AS paid_amount
           FROM payments
           GROUP BY invoice_id
         ) AS payment_totals ON payment_totals.invoice_id = invoices.id
@@ -316,8 +316,8 @@ const statements = {
         HAVING invoices.amount - COALESCE(SUM(payments.amount), 0) > 0.001
           AND invoices.due_date < date('now')
       )) AS overdue_invoice_count,
-      (SELECT COALESCE(SUM(amount), 0) FROM payments) AS total_collected,
-      (SELECT COALESCE(SUM(balance), 0) FROM (
+      (SELECT ROUND(COALESCE(SUM(amount), 0), 2) FROM payments) AS total_collected,
+      (SELECT ROUND(COALESCE(SUM(balance), 0), 2) FROM (
         SELECT invoices.amount - COALESCE(SUM(payments.amount), 0) AS balance
         FROM invoices
         LEFT JOIN payments ON payments.invoice_id = invoices.id
@@ -551,8 +551,8 @@ const server = http.createServer(async (req, res) => {
         name,
         code,
         clientType,
-        Number.isFinite(defaultTherapyFee) ? defaultTherapyFee : 0,
-        Number.isFinite(defaultSupervisionFee) ? defaultSupervisionFee : 0,
+        roundCurrency(Number.isFinite(defaultTherapyFee) ? defaultTherapyFee : 0),
+        roundCurrency(Number.isFinite(defaultSupervisionFee) ? defaultSupervisionFee : 0),
         address,
         city,
         stateName,
@@ -590,7 +590,7 @@ const server = http.createServer(async (req, res) => {
       const defaultFee = sessionType === "supervision"
         ? Number(client.default_supervision_fee || 0)
         : Number(client.default_therapy_fee || 0);
-      const feeAmount = manualFee > 0 ? manualFee : defaultFee;
+      const feeAmount = roundCurrency(manualFee > 0 ? manualFee : defaultFee);
 
       if (!Number.isFinite(feeAmount) || feeAmount <= 0) {
         return redirectWithFlash(res, "/dashboard", "Enter a valid session fee or set a default fee on the client.");
@@ -648,7 +648,7 @@ const server = http.createServer(async (req, res) => {
         sessionType,
         sessionDate,
         Math.round(durationMinutes),
-        feeAmount,
+        roundCurrency(feeAmount),
         notes,
         sessionId
       );
@@ -736,11 +736,13 @@ const server = http.createServer(async (req, res) => {
         return redirectWithFlash(res, "/dashboard", "Enter a valid payment amount.");
       }
 
-      if (amount - invoice.balance > 0.001) {
+      const paymentAmount = roundCurrency(amount);
+
+      if (paymentAmount - invoice.balance > 0.001) {
         return redirectWithFlash(res, "/dashboard", "Payment exceeds the remaining balance.");
       }
 
-      statements.createPayment.run(randomId(), invoice.id, amount, paymentDate, methodName, isoNow());
+      statements.createPayment.run(randomId(), invoice.id, paymentAmount, paymentDate, methodName, isoNow());
       return redirectWithFlash(res, "/dashboard", `Payment recorded for ${invoice.invoice_number}.`);
     }
 
@@ -1802,11 +1804,12 @@ function formatDisplayDate(value) {
 }
 
 function formatCurrency(value) {
+  const roundedValue = roundCurrency(value);
   return new Intl.NumberFormat("en-IN", {
     style: "currency",
     currency: "INR",
     maximumFractionDigits: 2
-  }).format(Number(value || 0));
+  }).format(roundedValue);
 }
 
 function escapeHtml(value) {
