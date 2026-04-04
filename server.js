@@ -1296,6 +1296,14 @@ function renderLayout({ title, content, bodyClass }) {
     </head>
     <body class="${bodyClass}">
       ${content}
+      <script>
+        document.addEventListener("wheel", function (event) {
+          const active = document.activeElement;
+          if (active && active.tagName === "INPUT" && active.type === "number") {
+            event.preventDefault();
+          }
+        }, { passive: false });
+      </script>
     </body>
   </html>`;
 }
