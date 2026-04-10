@@ -36,6 +36,7 @@ db.exec(`
 
   CREATE TABLE IF NOT EXISTS clients (
     id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
     name TEXT NOT NULL,
     code TEXT NOT NULL UNIQUE,
     client_type TEXT NOT NULL DEFAULT 'therapy',
@@ -48,11 +49,13 @@ db.exec(`
     gstin TEXT NOT NULL DEFAULT '',
     pan TEXT NOT NULL DEFAULT '',
     next_invoice_sequence INTEGER NOT NULL DEFAULT 1,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
   );
 
   CREATE TABLE IF NOT EXISTS invoices (
     id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
     client_id TEXT NOT NULL,
     invoice_number TEXT NOT NULL UNIQUE,
     invoice_kind TEXT NOT NULL DEFAULT 'manual',
@@ -70,6 +73,7 @@ db.exec(`
     place_of_supply TEXT NOT NULL DEFAULT '',
     supply_type TEXT NOT NULL DEFAULT 'intra',
     created_at TEXT NOT NULL,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
     FOREIGN KEY (client_id) REFERENCES clients(id) ON DELETE CASCADE
   );
 
@@ -93,6 +97,7 @@ db.exec(`
 
   CREATE TABLE IF NOT EXISTS session_logs (
     id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
     client_id TEXT NOT NULL,
     session_type TEXT NOT NULL,
     session_date TEXT NOT NULL,
@@ -101,11 +106,16 @@ db.exec(`
     notes TEXT NOT NULL DEFAULT '',
     invoice_id TEXT,
     created_at TEXT NOT NULL,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
     FOREIGN KEY (client_id) REFERENCES clients(id) ON DELETE CASCADE,
     FOREIGN KEY (invoice_id) REFERENCES invoices(id) ON DELETE SET NULL
   );
 `);
 
+migrateToMultiUserSchema();
+ensureColumnExists("clients", "user_id", "TEXT");
+ensureColumnExists("invoices", "user_id", "TEXT");
+ensureColumnExists("session_logs", "user_id", "TEXT");
 ensureColumnExists("clients", "client_type", "TEXT NOT NULL DEFAULT 'therapy'");
 ensureColumnExists("clients", "default_therapy_fee", "REAL NOT NULL DEFAULT 0");
 ensureColumnExists("clients", "default_supervision_fee", "REAL NOT NULL DEFAULT 0");
@@ -126,10 +136,13 @@ ensureColumnExists("invoices", "supply_type", "TEXT NOT NULL DEFAULT 'intra'");
 ensureColumnExists("invoices", "invoice_kind", "TEXT NOT NULL DEFAULT 'manual'");
 ensureColumnExists("invoices", "billing_month", "TEXT NOT NULL DEFAULT ''");
 
+backfillOwnership();
+
 const statements = {
   userCount: db.prepare("SELECT COUNT(*) AS count FROM users"),
   createUser: db.prepare("INSERT INTO users (id, email, password_hash, created_at) VALUES (?, ?, ?, ?)"),
   getUserByEmail: db.prepare("SELECT * FROM users WHERE email = ?"),
+  getUsers: db.prepare("SELECT id, email, created_at FROM users ORDER BY created_at ASC"),
   createSession: db.prepare("INSERT INTO sessions (id, user_id, expires_at, created_at) VALUES (?, ?, ?, ?)"),
   getSessionUser: db.prepare(`
     SELECT sessions.id AS session_id, sessions.expires_at, users.id AS user_id, users.email
@@ -141,34 +154,34 @@ const statements = {
   deleteExpiredSessions: db.prepare("DELETE FROM sessions WHERE expires_at < ?"),
   createClient: db.prepare(`
     INSERT INTO clients (
-      id, name, code, client_type, default_therapy_fee, default_supervision_fee,
+      id, user_id, name, code, client_type, default_therapy_fee, default_supervision_fee,
       address, city, state, pincode, gstin, pan, next_invoice_sequence, created_at
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `),
-  getClients: db.prepare("SELECT * FROM clients ORDER BY created_at DESC"),
-  getClientById: db.prepare("SELECT * FROM clients WHERE id = ?"),
-  getClientByCode: db.prepare("SELECT * FROM clients WHERE code = ?"),
-  updateClientSequence: db.prepare("UPDATE clients SET next_invoice_sequence = ? WHERE id = ?"),
+  getClients: db.prepare("SELECT * FROM clients WHERE user_id = ? ORDER BY created_at DESC"),
+  getClientById: db.prepare("SELECT * FROM clients WHERE id = ? AND user_id = ?"),
+  getClientByCode: db.prepare("SELECT * FROM clients WHERE code = ? AND user_id = ?"),
+  updateClientSequence: db.prepare("UPDATE clients SET next_invoice_sequence = ? WHERE id = ? AND user_id = ?"),
   getSessionById: db.prepare(`
     SELECT session_logs.*, clients.name AS client_name, clients.code AS client_code
     FROM session_logs
     JOIN clients ON clients.id = session_logs.client_id
-    WHERE session_logs.id = ?
+    WHERE session_logs.id = ? AND session_logs.user_id = ?
   `),
   createInvoice: db.prepare(`
     INSERT INTO invoices (
-      id, client_id, invoice_number, invoice_kind, billing_month, issue_date, due_date, amount, description, item_name,
+      id, user_id, client_id, invoice_number, invoice_kind, billing_month, issue_date, due_date, amount, description, item_name,
       hsn_sac, quantity, rate, gst_rate, country_of_supply, place_of_supply, supply_type, created_at
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `),
   getInvoiceById: db.prepare(`
     SELECT invoices.*, clients.name AS client_name, clients.code AS client_code,
       clients.address, clients.city, clients.state, clients.pincode, clients.gstin, clients.pan
     FROM invoices
     JOIN clients ON clients.id = invoices.client_id
-    WHERE invoices.id = ?
+    WHERE invoices.id = ? AND invoices.user_id = ?
   `),
   getInvoicesWithBalances: db.prepare(`
     SELECT
@@ -186,6 +199,7 @@ const statements = {
     FROM invoices
     JOIN clients ON clients.id = invoices.client_id
     LEFT JOIN payments ON payments.invoice_id = invoices.id
+    WHERE invoices.user_id = ?
     GROUP BY invoices.id
     ORDER BY invoices.created_at DESC
   `),
@@ -204,6 +218,7 @@ const statements = {
     FROM invoices
     JOIN clients ON clients.id = invoices.client_id
     LEFT JOIN payments ON payments.invoice_id = invoices.id
+    WHERE invoices.user_id = ?
     GROUP BY invoices.id
     HAVING balance > 0.001
     ORDER BY invoices.due_date ASC
@@ -220,20 +235,21 @@ const statements = {
   `),
   createSessionLog: db.prepare(`
     INSERT INTO session_logs (
-      id, client_id, session_type, session_date, duration_minutes, fee_amount, notes, invoice_id, created_at
+      id, user_id, client_id, session_type, session_date, duration_minutes, fee_amount, notes, invoice_id, created_at
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `),
   attachSessionsToInvoice: db.prepare("UPDATE session_logs SET invoice_id = ? WHERE id = ?"),
   updateSessionLog: db.prepare(`
     UPDATE session_logs
     SET client_id = ?, session_type = ?, session_date = ?, duration_minutes = ?, fee_amount = ?, notes = ?
-    WHERE id = ?
+    WHERE id = ? AND user_id = ?
   `),
   getRecentSessionLogs: db.prepare(`
     SELECT session_logs.*, clients.name AS client_name, clients.code AS client_code
     FROM session_logs
     JOIN clients ON clients.id = session_logs.client_id
+    WHERE session_logs.user_id = ?
     ORDER BY session_date DESC, session_logs.created_at DESC
     LIMIT 12
   `),
@@ -248,15 +264,19 @@ const statements = {
     SELECT *
     FROM session_logs
     WHERE client_id = ?
+      AND user_id = ?
       AND invoice_id IS NULL
       AND substr(session_date, 1, 7) = ?
     ORDER BY session_date ASC, created_at ASC
   `),
   getMonthlyMetrics: db.prepare(`
     SELECT
-      (SELECT COUNT(*) FROM session_logs WHERE substr(session_date, 1, 7) = ?) AS session_count,
-      (SELECT ROUND(COALESCE(SUM(fee_amount), 0), 2) FROM session_logs WHERE substr(session_date, 1, 7) = ?) AS billed_from_sessions,
-      (SELECT ROUND(COALESCE(SUM(amount), 0), 2) FROM payments WHERE substr(payment_date, 1, 7) = ?) AS collected_from_payments,
+      (SELECT COUNT(*) FROM session_logs WHERE user_id = ? AND substr(session_date, 1, 7) = ?) AS session_count,
+      (SELECT ROUND(COALESCE(SUM(fee_amount), 0), 2) FROM session_logs WHERE user_id = ? AND substr(session_date, 1, 7) = ?) AS billed_from_sessions,
+      (SELECT ROUND(COALESCE(SUM(payments.amount), 0), 2)
+        FROM payments
+        JOIN invoices ON invoices.id = payments.invoice_id
+        WHERE invoices.user_id = ? AND substr(payment_date, 1, 7) = ?) AS collected_from_payments,
       (SELECT ROUND(COALESCE(SUM(invoices.amount - COALESCE(payment_totals.paid_amount, 0)), 0), 2)
         FROM invoices
         LEFT JOIN (
@@ -264,20 +284,20 @@ const statements = {
           FROM payments
           GROUP BY invoice_id
         ) AS payment_totals ON payment_totals.invoice_id = invoices.id
-        WHERE substr(invoices.issue_date, 1, 7) = ?
+        WHERE invoices.user_id = ? AND substr(invoices.issue_date, 1, 7) = ?
       ) AS pending_for_month
   `),
   getClientMonthReport: db.prepare(`
     SELECT
       clients.id AS client_id,
       clients.name AS client_name,
-      (SELECT COUNT(*) FROM session_logs WHERE session_logs.client_id = clients.id AND substr(session_logs.session_date, 1, 7) = ?) AS session_count,
-      (SELECT COUNT(*) FROM invoices WHERE invoices.client_id = clients.id) AS invoice_count,
-      (SELECT ROUND(COALESCE(SUM(invoices.amount), 0), 2) FROM invoices WHERE invoices.client_id = clients.id AND substr(invoices.issue_date, 1, 7) = ?) AS invoiced_total,
+      (SELECT COUNT(*) FROM session_logs WHERE session_logs.client_id = clients.id AND session_logs.user_id = clients.user_id AND substr(session_logs.session_date, 1, 7) = ?) AS session_count,
+      (SELECT COUNT(*) FROM invoices WHERE invoices.client_id = clients.id AND invoices.user_id = clients.user_id) AS invoice_count,
+      (SELECT ROUND(COALESCE(SUM(invoices.amount), 0), 2) FROM invoices WHERE invoices.client_id = clients.id AND invoices.user_id = clients.user_id AND substr(invoices.issue_date, 1, 7) = ?) AS invoiced_total,
       (SELECT ROUND(COALESCE(SUM(payments.amount), 0), 2)
         FROM payments
         JOIN invoices ON invoices.id = payments.invoice_id
-        WHERE invoices.client_id = clients.id AND substr(payments.payment_date, 1, 7) = ?) AS collected_total,
+        WHERE invoices.client_id = clients.id AND invoices.user_id = clients.user_id AND substr(payments.payment_date, 1, 7) = ?) AS collected_total,
       (SELECT ROUND(COALESCE(SUM(invoices.amount - COALESCE(payment_totals.paid_amount, 0)), 0), 2)
         FROM invoices
         LEFT JOIN (
@@ -285,8 +305,9 @@ const statements = {
           FROM payments
           GROUP BY invoice_id
         ) AS payment_totals ON payment_totals.invoice_id = invoices.id
-        WHERE invoices.client_id = clients.id AND substr(invoices.issue_date, 1, 7) = ?) AS pending_total
+        WHERE invoices.client_id = clients.id AND invoices.user_id = clients.user_id AND substr(invoices.issue_date, 1, 7) = ?) AS pending_total
     FROM clients
+    WHERE clients.user_id = ?
     ORDER BY clients.name ASC
   `),
   getRecentPayments: db.prepare(`
@@ -294,17 +315,19 @@ const statements = {
     FROM payments
     JOIN invoices ON invoices.id = payments.invoice_id
     JOIN clients ON clients.id = invoices.client_id
+    WHERE invoices.user_id = ?
     ORDER BY payments.payment_date DESC, payments.created_at DESC
     LIMIT 12
   `),
   getDashboardSummary: db.prepare(`
     SELECT
-      (SELECT COUNT(*) FROM clients) AS client_count,
-      (SELECT COUNT(*) FROM invoices) AS invoice_count,
+      (SELECT COUNT(*) FROM clients WHERE user_id = ?) AS client_count,
+      (SELECT COUNT(*) FROM invoices WHERE user_id = ?) AS invoice_count,
       (SELECT COUNT(*) FROM (
         SELECT invoices.id
         FROM invoices
         LEFT JOIN payments ON payments.invoice_id = invoices.id
+        WHERE invoices.user_id = ?
         GROUP BY invoices.id
         HAVING invoices.amount - COALESCE(SUM(payments.amount), 0) > 0.001
       )) AS pending_invoice_count,
@@ -312,15 +335,20 @@ const statements = {
         SELECT invoices.id
         FROM invoices
         LEFT JOIN payments ON payments.invoice_id = invoices.id
+        WHERE invoices.user_id = ?
         GROUP BY invoices.id
         HAVING invoices.amount - COALESCE(SUM(payments.amount), 0) > 0.001
           AND invoices.due_date < date('now')
       )) AS overdue_invoice_count,
-      (SELECT ROUND(COALESCE(SUM(amount), 0), 2) FROM payments) AS total_collected,
+      (SELECT ROUND(COALESCE(SUM(payments.amount), 0), 2)
+        FROM payments
+        JOIN invoices ON invoices.id = payments.invoice_id
+        WHERE invoices.user_id = ?) AS total_collected,
       (SELECT ROUND(COALESCE(SUM(balance), 0), 2) FROM (
         SELECT invoices.amount - COALESCE(SUM(payments.amount), 0) AS balance
         FROM invoices
         LEFT JOIN payments ON payments.invoice_id = invoices.id
+        WHERE invoices.user_id = ?
         GROUP BY invoices.id
       )) AS total_outstanding
   `),
@@ -421,8 +449,66 @@ const server = http.createServer(async (req, res) => {
         action: "/login",
         submitLabel: "Sign In",
         message: "Access your invoices, reports, and payment tracker.",
-        flash
+        flash,
+        secondaryLink: { href: "/register", label: "Create a new account" }
       }));
+    }
+
+    if (method === "GET" && url.pathname === "/register") {
+      if (shouldShowSetup()) {
+        return redirect(res, "/setup");
+      }
+
+      if (user) {
+        return redirect(res, "/dashboard");
+      }
+
+      return sendHtml(res, 200, renderAuthPage({
+        title: "Create Account",
+        action: "/register",
+        submitLabel: "Create Account",
+        message: "Create your own login to manage your own clients, sessions, invoices, and payments.",
+        flash,
+        secondaryLink: { href: "/login", label: "Back to sign in" }
+      }));
+    }
+
+    if (method === "POST" && url.pathname === "/register") {
+      if (shouldShowSetup()) {
+        return redirect(res, "/setup");
+      }
+
+      const form = await parseForm(req);
+      const email = String(form.email || "").trim().toLowerCase();
+      const password = String(form.password || "");
+
+      if (!email || !password || password.length < 8) {
+        return redirectWithFlash(res, "/register", "Use a valid email and a password with at least 8 characters.");
+      }
+
+      if (statements.getUserByEmail.get(email)) {
+        return redirectWithFlash(res, "/register", "An account with that email already exists.");
+      }
+
+      statements.createUser.run(randomId(), email, hashPassword(password), isoNow());
+      return redirectWithFlash(res, "/login", "Account created. Please sign in.");
+    }
+
+    if (method === "POST" && url.pathname === "/users") {
+      const form = await parseForm(req);
+      const email = String(form.email || "").trim().toLowerCase();
+      const password = String(form.password || "");
+
+      if (!email || !password || password.length < 8) {
+        return redirectWithFlash(res, "/dashboard", "Use a valid email and a password with at least 8 characters.");
+      }
+
+      if (statements.getUserByEmail.get(email)) {
+        return redirectWithFlash(res, "/dashboard", "An account with that email already exists.");
+      }
+
+      statements.createUser.run(randomId(), email, hashPassword(password), isoNow());
+      return redirectWithFlash(res, "/dashboard", `Login created for ${email}.`);
     }
 
     if (method === "POST" && url.pathname === "/login") {
@@ -491,6 +577,7 @@ const server = http.createServer(async (req, res) => {
     if (method === "GET" && url.pathname === "/dashboard") {
       return sendHtml(res, 200, renderDashboard({
         flash,
+        userId: user.id,
         userEmail: user.email,
         selectedMonth: normalizeMonth(url.searchParams.get("month")) || formatInputDate(new Date()).slice(0, 7),
         selectedInvoiceId: url.searchParams.get("invoiceId") || ""
@@ -499,7 +586,7 @@ const server = http.createServer(async (req, res) => {
 
     if (method === "GET" && url.pathname.startsWith("/sessions/") && url.pathname.endsWith("/edit")) {
       const sessionId = url.pathname.split("/")[2];
-      const sessionLog = statements.getSessionById.get(sessionId);
+      const sessionLog = statements.getSessionById.get(sessionId, user.id);
 
       if (!sessionLog) {
         return redirectWithFlash(res, "/dashboard", "Session not found.");
@@ -507,14 +594,14 @@ const server = http.createServer(async (req, res) => {
 
       return sendHtml(res, 200, renderSessionEditPage({
         flash,
-        clients: statements.getClients.all(),
+        clients: statements.getClients.all(user.id),
         sessionLog
       }));
     }
 
     if (method === "GET" && url.pathname.startsWith("/invoices/") && url.pathname.endsWith("/view")) {
       const invoiceId = url.pathname.split("/")[2];
-      const invoice = getInvoiceWithBalance(invoiceId);
+      const invoice = getInvoiceWithBalance(invoiceId, user.id);
 
       if (!invoice) {
         return sendText(res, 404, "Invoice not found.");
@@ -542,12 +629,13 @@ const server = http.createServer(async (req, res) => {
         return redirectWithFlash(res, "/dashboard", "Client name and code are required.");
       }
 
-      if (statements.getClientByCode.get(code)) {
+      if (statements.getClientByCode.get(code, user.id)) {
         return redirectWithFlash(res, "/dashboard", "That client code already exists.");
       }
 
       statements.createClient.run(
         randomId(),
+        user.id,
         name,
         code,
         clientType,
@@ -573,7 +661,7 @@ const server = http.createServer(async (req, res) => {
       const durationMinutes = Number(form.durationMinutes || 50);
       const manualFee = Number(form.feeAmount || 0);
       const notes = String(form.notes || "").trim();
-      const client = statements.getClientById.get(clientId);
+      const client = statements.getClientById.get(clientId, user.id);
 
       if (!client) {
         return redirectWithFlash(res, "/dashboard", "Choose a valid client.");
@@ -598,6 +686,7 @@ const server = http.createServer(async (req, res) => {
 
       statements.createSessionLog.run(
         randomId(),
+        user.id,
         client.id,
         sessionType,
         sessionDate,
@@ -612,7 +701,7 @@ const server = http.createServer(async (req, res) => {
 
     if (method === "POST" && url.pathname.startsWith("/sessions/") && !url.pathname.endsWith("/edit")) {
       const sessionId = url.pathname.split("/")[2];
-      const existingSession = statements.getSessionById.get(sessionId);
+      const existingSession = statements.getSessionById.get(sessionId, user.id);
 
       if (!existingSession) {
         return redirectWithFlash(res, "/dashboard", "Session not found.");
@@ -629,7 +718,7 @@ const server = http.createServer(async (req, res) => {
       const durationMinutes = Number(form.durationMinutes || 50);
       const feeAmount = Number(form.feeAmount || 0);
       const notes = String(form.notes || "").trim();
-      const client = statements.getClientById.get(clientId);
+      const client = statements.getClientById.get(clientId, user.id);
 
       if (!client) {
         return redirectWithFlash(res, `/sessions/${sessionId}/edit`, "Choose a valid client.");
@@ -650,7 +739,8 @@ const server = http.createServer(async (req, res) => {
         Math.round(durationMinutes),
         roundCurrency(feeAmount),
         notes,
-        sessionId
+        sessionId,
+        user.id
       );
 
       return redirectWithFlash(res, "/dashboard", "Session updated.");
@@ -663,7 +753,7 @@ const server = http.createServer(async (req, res) => {
       const issueDate = String(form.issueDate || "");
       const dueDate = String(form.dueDate || "");
       const description = String(form.description || "").trim();
-      const client = statements.getClientById.get(clientId);
+      const client = statements.getClientById.get(clientId, user.id);
 
       if (!client) {
         return redirectWithFlash(res, "/dashboard", "Choose a valid client for invoice generation.");
@@ -677,7 +767,7 @@ const server = http.createServer(async (req, res) => {
         return redirectWithFlash(res, "/dashboard", "Invoice dates are invalid.");
       }
 
-      const sessionsForMonth = statements.getUninvoicedSessionsForMonth.all(client.id, billingMonth);
+      const sessionsForMonth = statements.getUninvoicedSessionsForMonth.all(client.id, user.id, billingMonth);
 
       if (sessionsForMonth.length === 0) {
         return redirectWithFlash(res, "/dashboard", "No uninvoiced sessions found for that client and month.");
@@ -690,6 +780,7 @@ const server = http.createServer(async (req, res) => {
 
       statements.createInvoice.run(
         invoiceId,
+        user.id,
         client.id,
         invoiceNumber,
         "monthly_sessions",
@@ -708,7 +799,7 @@ const server = http.createServer(async (req, res) => {
         "intra",
         isoNow()
       );
-      statements.updateClientSequence.run(client.next_invoice_sequence + 1, client.id);
+      statements.updateClientSequence.run(client.next_invoice_sequence + 1, client.id, user.id);
       for (const sessionLog of sessionsForMonth) {
         statements.attachSessionsToInvoice.run(invoiceId, sessionLog.id);
       }
@@ -722,7 +813,7 @@ const server = http.createServer(async (req, res) => {
       const amount = Number(form.amount);
       const paymentDate = String(form.paymentDate || "");
       const methodName = String(form.method || "").trim();
-      const invoice = getInvoiceWithBalance(invoiceId);
+      const invoice = getInvoiceWithBalance(invoiceId, user.id);
 
       if (!invoice) {
         return redirectWithFlash(res, "/dashboard", "Choose a valid invoice.");
@@ -748,7 +839,7 @@ const server = http.createServer(async (req, res) => {
 
     if (method === "POST" && url.pathname.startsWith("/invoices/") && url.pathname.endsWith("/share")) {
       const invoiceId = url.pathname.split("/")[2];
-      const invoice = statements.getInvoiceById.get(invoiceId);
+      const invoice = statements.getInvoiceById.get(invoiceId, user.id);
 
       if (!invoice) {
         return redirectWithFlash(res, "/dashboard", "Invoice not found.");
@@ -761,7 +852,7 @@ const server = http.createServer(async (req, res) => {
 
     if (method === "GET" && url.pathname.startsWith("/invoices/") && url.pathname.endsWith("/pdf")) {
       const invoiceId = url.pathname.split("/")[2];
-      const invoice = getInvoiceWithBalance(invoiceId);
+      const invoice = getInvoiceWithBalance(invoiceId, user.id);
 
       if (!invoice) {
         return sendText(res, 404, "Invoice not found.");
@@ -790,17 +881,18 @@ server.listen(PORT, HOST, () => {
   console.log(`InvoiceFlow running at http://${HOST}:${PORT}`);
 });
 
-function renderDashboard({ flash, userEmail, selectedMonth, selectedInvoiceId }) {
-  const clients = statements.getClients.all();
-  const invoices = statements.getInvoicesWithBalances.all().map(enrichInvoice);
-  const pendingInvoices = statements.getPendingInvoices.all().map(enrichInvoice);
-  const summary = statements.getDashboardSummary.get();
-  const recentSessions = statements.getRecentSessionLogs.all();
+function renderDashboard({ flash, userId, userEmail, selectedMonth, selectedInvoiceId }) {
+  const clients = statements.getClients.all(userId);
+  const invoices = statements.getInvoicesWithBalances.all(userId).map(enrichInvoice);
+  const pendingInvoices = statements.getPendingInvoices.all(userId).map(enrichInvoice);
+  const users = statements.getUsers.all();
+  const summary = statements.getDashboardSummary.get(userId, userId, userId, userId, userId, userId);
+  const recentSessions = statements.getRecentSessionLogs.all(userId);
   const today = formatInputDate(new Date());
   const currentMonth = selectedMonth || today.slice(0, 7);
-  const monthlyMetrics = statements.getMonthlyMetrics.get(currentMonth, currentMonth, currentMonth, currentMonth);
-  const clientMonthReport = statements.getClientMonthReport.all(currentMonth, currentMonth, currentMonth, currentMonth);
-  const recentPayments = statements.getRecentPayments.all();
+  const monthlyMetrics = statements.getMonthlyMetrics.get(userId, currentMonth, userId, currentMonth, userId, currentMonth, userId, currentMonth);
+  const clientMonthReport = statements.getClientMonthReport.all(currentMonth, currentMonth, currentMonth, currentMonth, userId);
+  const recentPayments = statements.getRecentPayments.all(userId);
 
   return renderLayout({
     title: "PracticeFlow Dashboard",
@@ -853,6 +945,51 @@ function renderDashboard({ flash, userEmail, selectedMonth, selectedInvoiceId })
         </section>
 
         <main class="workspace-grid">
+          <section class="card card-form">
+            <div class="section-heading">
+              <div>
+                <p class="section-label">Access</p>
+                <h2>Create User Login</h2>
+              </div>
+            </div>
+
+            <form class="stack" action="/users" method="post">
+              <label>
+                User email
+                <input name="email" type="email" placeholder="therapist@example.com" required />
+              </label>
+              <label>
+                Temporary password
+                <input name="password" type="password" minlength="8" placeholder="At least 8 characters" required />
+              </label>
+              <div class="info-banner">Each login gets its own private clients, sessions, invoices, payments, and reports.</div>
+              <button class="primary-button" type="submit">Create Login</button>
+            </form>
+
+            <div class="list-section">
+              <div class="section-heading compact">
+                <div>
+                  <p class="section-label">Accounts</p>
+                  <h3>Available Logins</h3>
+                </div>
+              </div>
+              <div class="list-panel">
+                ${
+                  users.length
+                    ? users.map((account) => `
+                      <article class="client-item">
+                        <strong>${escapeHtml(account.email)}</strong>
+                        <div class="client-meta">
+                          <span>Created ${formatDisplayDate(account.created_at)}</span>
+                        </div>
+                      </article>
+                    `).join("")
+                    : renderEmptyState("No additional logins yet.")
+                }
+              </div>
+            </div>
+          </section>
+
           <section class="card card-form">
             <div class="section-heading">
               <div>
@@ -1171,7 +1308,7 @@ function renderDashboard({ flash, userEmail, selectedMonth, selectedInvoiceId })
   });
 }
 
-function renderAuthPage({ title, action, submitLabel, message, flash }) {
+function renderAuthPage({ title, action, submitLabel, message, flash, secondaryLink }) {
   return renderLayout({
     title,
     bodyClass: "auth-body",
@@ -1193,6 +1330,7 @@ function renderAuthPage({ title, action, submitLabel, message, flash }) {
             </label>
             <button class="primary-button" type="submit">${escapeHtml(submitLabel)}</button>
           </form>
+          ${secondaryLink ? `<p class="hero-copy"><a href="${secondaryLink.href}">${escapeHtml(secondaryLink.label)}</a></p>` : ""}
         </section>
       </main>
     `
@@ -1309,7 +1447,7 @@ function renderLayout({ title, content, bodyClass }) {
 }
 
 function renderClientCard(client) {
-  const outstanding = getClientOutstanding(client.id);
+  const outstanding = getClientOutstanding(client.id, client.user_id);
   return `
     <article class="client-item">
       <strong>${escapeHtml(client.name)}</strong>
@@ -1322,7 +1460,7 @@ function renderClientCard(client) {
         <span>Supervision fee: ${formatCurrency(client.default_supervision_fee || 0)}</span>
       </div>
       <div class="client-meta">
-        <span>${countClientInvoices(client.id)} invoice(s)</span>
+        <span>${countClientInvoices(client.id, client.user_id)} invoice(s)</span>
         <span>${formatCurrency(outstanding)} outstanding</span>
       </div>
     </article>
@@ -1583,8 +1721,8 @@ function renderInvoiceDocument(invoice, payments, { isPublic }) {
   `;
 }
 
-function getInvoiceWithBalance(invoiceId) {
-  const invoice = statements.getInvoicesWithBalances.all().find((item) => item.id === invoiceId);
+function getInvoiceWithBalance(invoiceId, userId) {
+  const invoice = statements.getInvoicesWithBalances.all(userId).find((item) => item.id === invoiceId);
   return invoice ? enrichInvoice(invoice) : null;
 }
 
@@ -1628,21 +1766,21 @@ function enrichInvoice(invoice) {
   };
 }
 
-function countClientInvoices(clientId) {
-  return db.prepare("SELECT COUNT(*) AS count FROM invoices WHERE client_id = ?").get(clientId).count;
+function countClientInvoices(clientId, userId) {
+  return db.prepare("SELECT COUNT(*) AS count FROM invoices WHERE client_id = ? AND user_id = ?").get(clientId, userId).count;
 }
 
-function getClientOutstanding(clientId) {
+function getClientOutstanding(clientId, userId) {
   const row = db.prepare(`
     SELECT COALESCE(SUM(balance), 0) AS outstanding
     FROM (
       SELECT invoices.amount - COALESCE(SUM(payments.amount), 0) AS balance
       FROM invoices
       LEFT JOIN payments ON payments.invoice_id = invoices.id
-      WHERE invoices.client_id = ?
+      WHERE invoices.client_id = ? AND invoices.user_id = ?
       GROUP BY invoices.id
     )
-  `).get(clientId);
+  `).get(clientId, userId);
 
   return Number((row?.outstanding || 0).toFixed(2));
 }
@@ -1897,11 +2035,343 @@ function escapePdfText(value) {
   return String(value).replaceAll("\\", "\\\\").replaceAll("(", "\\(").replaceAll(")", "\\)");
 }
 
+function migrateToMultiUserSchema() {
+  const firstUser = db.prepare("SELECT id FROM users ORDER BY created_at ASC LIMIT 1").get();
+  const fallbackUserId = firstUser?.id || "";
+  const needsClientsMigration = !tableHasColumn("clients", "user_id") || !hasCompositeUniqueIndex("clients", ["user_id", "code"]);
+  const needsInvoicesMigration = !tableHasColumn("invoices", "user_id") || !hasCompositeUniqueIndex("invoices", ["user_id", "invoice_number"]);
+  const needsSessionLogsMigration = !tableHasColumn("session_logs", "user_id");
+  const needsPaymentsMigration = foreignKeyTargetsTable("payments", "invoices_legacy_multi_user");
+  const needsShareLinksMigration = foreignKeyTargetsTable("invoice_share_links", "invoices_legacy_multi_user");
+
+  if (!needsClientsMigration && !needsInvoicesMigration && !needsSessionLogsMigration && !needsPaymentsMigration && !needsShareLinksMigration) {
+    return;
+  }
+
+  db.exec("PRAGMA foreign_keys = OFF");
+
+  try {
+    const migrate = db.transaction(() => {
+      if (needsClientsMigration) {
+        migrateClientsTable(fallbackUserId);
+      }
+
+      if (needsInvoicesMigration) {
+        migrateInvoicesTable(fallbackUserId);
+      }
+
+      if (needsSessionLogsMigration) {
+        migrateSessionLogsTable(fallbackUserId);
+      }
+
+      if (needsInvoicesMigration || needsPaymentsMigration) {
+        migratePaymentsTable();
+      }
+
+      if (needsInvoicesMigration || needsShareLinksMigration) {
+        migrateShareLinksTable();
+      }
+    });
+
+    migrate();
+  } finally {
+    db.exec("PRAGMA foreign_keys = ON");
+  }
+}
+
+function migrateClientsTable(fallbackUserId) {
+  const oldTableName = "clients_legacy_multi_user";
+  db.exec(`ALTER TABLE clients RENAME TO ${oldTableName}`);
+  db.exec(`
+    CREATE TABLE clients (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      name TEXT NOT NULL,
+      code TEXT NOT NULL,
+      client_type TEXT NOT NULL DEFAULT 'therapy',
+      default_therapy_fee REAL NOT NULL DEFAULT 0,
+      default_supervision_fee REAL NOT NULL DEFAULT 0,
+      address TEXT NOT NULL DEFAULT '',
+      city TEXT NOT NULL DEFAULT '',
+      state TEXT NOT NULL DEFAULT '',
+      pincode TEXT NOT NULL DEFAULT '',
+      gstin TEXT NOT NULL DEFAULT '',
+      pan TEXT NOT NULL DEFAULT '',
+      next_invoice_sequence INTEGER NOT NULL DEFAULT 1,
+      created_at TEXT NOT NULL,
+      UNIQUE (user_id, code),
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    )
+  `);
+
+  const oldColumns = new Set(db.prepare(`PRAGMA table_info(${oldTableName})`).all().map((column) => column.name));
+  const userExpression = oldColumns.has("user_id") ? "COALESCE(NULLIF(user_id, ''), ?)" : "?";
+  const clientTypeExpression = oldColumns.has("client_type") ? "COALESCE(client_type, 'therapy')" : "'therapy'";
+  const therapyFeeExpression = oldColumns.has("default_therapy_fee") ? "COALESCE(default_therapy_fee, 0)" : "0";
+  const supervisionFeeExpression = oldColumns.has("default_supervision_fee") ? "COALESCE(default_supervision_fee, 0)" : "0";
+  const addressExpression = oldColumns.has("address") ? "COALESCE(address, '')" : "''";
+  const cityExpression = oldColumns.has("city") ? "COALESCE(city, '')" : "''";
+  const stateExpression = oldColumns.has("state") ? "COALESCE(state, '')" : "''";
+  const pincodeExpression = oldColumns.has("pincode") ? "COALESCE(pincode, '')" : "''";
+  const gstinExpression = oldColumns.has("gstin") ? "COALESCE(gstin, '')" : "''";
+  const panExpression = oldColumns.has("pan") ? "COALESCE(pan, '')" : "''";
+  const nextSequenceExpression = oldColumns.has("next_invoice_sequence") ? "COALESCE(next_invoice_sequence, 1)" : "1";
+
+  db.prepare(`
+    INSERT INTO clients (
+      id, user_id, name, code, client_type, default_therapy_fee, default_supervision_fee,
+      address, city, state, pincode, gstin, pan, next_invoice_sequence, created_at
+    )
+    SELECT
+      id,
+      ${userExpression},
+      name,
+      code,
+      ${clientTypeExpression},
+      ${therapyFeeExpression},
+      ${supervisionFeeExpression},
+      ${addressExpression},
+      ${cityExpression},
+      ${stateExpression},
+      ${pincodeExpression},
+      ${gstinExpression},
+      ${panExpression},
+      ${nextSequenceExpression},
+      created_at
+    FROM ${oldTableName}
+  `).run(fallbackUserId);
+
+  db.exec(`DROP TABLE ${oldTableName}`);
+}
+
+function migrateInvoicesTable(fallbackUserId) {
+  const oldTableName = "invoices_legacy_multi_user";
+  db.exec(`ALTER TABLE invoices RENAME TO ${oldTableName}`);
+  db.exec(`
+    CREATE TABLE invoices (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      client_id TEXT NOT NULL,
+      invoice_number TEXT NOT NULL,
+      invoice_kind TEXT NOT NULL DEFAULT 'manual',
+      billing_month TEXT NOT NULL DEFAULT '',
+      issue_date TEXT NOT NULL,
+      due_date TEXT NOT NULL,
+      amount REAL NOT NULL,
+      description TEXT NOT NULL DEFAULT '',
+      item_name TEXT NOT NULL DEFAULT '',
+      hsn_sac TEXT NOT NULL DEFAULT '',
+      quantity REAL NOT NULL DEFAULT 1,
+      rate REAL NOT NULL DEFAULT 0,
+      gst_rate REAL NOT NULL DEFAULT 18,
+      country_of_supply TEXT NOT NULL DEFAULT 'India',
+      place_of_supply TEXT NOT NULL DEFAULT '',
+      supply_type TEXT NOT NULL DEFAULT 'intra',
+      created_at TEXT NOT NULL,
+      UNIQUE (user_id, invoice_number),
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+      FOREIGN KEY (client_id) REFERENCES clients(id) ON DELETE CASCADE
+    )
+  `);
+
+  const oldColumns = new Set(db.prepare(`PRAGMA table_info(${oldTableName})`).all().map((column) => column.name));
+  const userExpression = oldColumns.has("user_id")
+    ? "COALESCE(NULLIF(user_id, ''), (SELECT user_id FROM clients WHERE clients.id = invoices_legacy_multi_user.client_id), ?)"
+    : "COALESCE((SELECT user_id FROM clients WHERE clients.id = invoices_legacy_multi_user.client_id), ?)";
+  const invoiceKindExpression = oldColumns.has("invoice_kind") ? "COALESCE(invoice_kind, 'manual')" : "'manual'";
+  const billingMonthExpression = oldColumns.has("billing_month") ? "COALESCE(billing_month, '')" : "''";
+  const itemNameExpression = oldColumns.has("item_name") ? "COALESCE(item_name, '')" : "''";
+  const hsnExpression = oldColumns.has("hsn_sac") ? "COALESCE(hsn_sac, '')" : "''";
+  const quantityExpression = oldColumns.has("quantity") ? "COALESCE(quantity, 1)" : "1";
+  const rateExpression = oldColumns.has("rate") ? "COALESCE(rate, 0)" : "0";
+  const gstRateExpression = oldColumns.has("gst_rate") ? "COALESCE(gst_rate, 18)" : "18";
+  const countryExpression = oldColumns.has("country_of_supply") ? "COALESCE(country_of_supply, 'India')" : "'India'";
+  const placeExpression = oldColumns.has("place_of_supply") ? "COALESCE(place_of_supply, '')" : "''";
+  const supplyTypeExpression = oldColumns.has("supply_type") ? "COALESCE(supply_type, 'intra')" : "'intra'";
+
+  db.prepare(`
+    INSERT INTO invoices (
+      id, user_id, client_id, invoice_number, invoice_kind, billing_month, issue_date, due_date,
+      amount, description, item_name, hsn_sac, quantity, rate, gst_rate, country_of_supply,
+      place_of_supply, supply_type, created_at
+    )
+    SELECT
+      id,
+      ${userExpression},
+      client_id,
+      invoice_number,
+      ${invoiceKindExpression},
+      ${billingMonthExpression},
+      issue_date,
+      due_date,
+      amount,
+      description,
+      ${itemNameExpression},
+      ${hsnExpression},
+      ${quantityExpression},
+      ${rateExpression},
+      ${gstRateExpression},
+      ${countryExpression},
+      ${placeExpression},
+      ${supplyTypeExpression},
+      created_at
+    FROM ${oldTableName}
+  `).run(fallbackUserId);
+
+  db.exec(`DROP TABLE ${oldTableName}`);
+}
+
+function migrateSessionLogsTable(fallbackUserId) {
+  const oldTableName = "session_logs_legacy_multi_user";
+  db.exec(`ALTER TABLE session_logs RENAME TO ${oldTableName}`);
+  db.exec(`
+    CREATE TABLE session_logs (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      client_id TEXT NOT NULL,
+      session_type TEXT NOT NULL,
+      session_date TEXT NOT NULL,
+      duration_minutes INTEGER NOT NULL DEFAULT 50,
+      fee_amount REAL NOT NULL,
+      notes TEXT NOT NULL DEFAULT '',
+      invoice_id TEXT,
+      created_at TEXT NOT NULL,
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+      FOREIGN KEY (client_id) REFERENCES clients(id) ON DELETE CASCADE,
+      FOREIGN KEY (invoice_id) REFERENCES invoices(id) ON DELETE SET NULL
+    )
+  `);
+
+  const oldColumns = new Set(db.prepare(`PRAGMA table_info(${oldTableName})`).all().map((column) => column.name));
+  const userExpression = oldColumns.has("user_id")
+    ? "COALESCE(NULLIF(user_id, ''), (SELECT user_id FROM clients WHERE clients.id = session_logs_legacy_multi_user.client_id), ?)"
+    : "COALESCE((SELECT user_id FROM clients WHERE clients.id = session_logs_legacy_multi_user.client_id), ?)";
+  const notesExpression = oldColumns.has("notes") ? "COALESCE(notes, '')" : "''";
+  const invoiceExpression = oldColumns.has("invoice_id") ? "invoice_id" : "NULL";
+  const durationExpression = oldColumns.has("duration_minutes") ? "COALESCE(duration_minutes, 50)" : "50";
+
+  db.prepare(`
+    INSERT INTO session_logs (
+      id, user_id, client_id, session_type, session_date, duration_minutes, fee_amount, notes, invoice_id, created_at
+    )
+    SELECT
+      id,
+      ${userExpression},
+      client_id,
+      session_type,
+      session_date,
+      ${durationExpression},
+      fee_amount,
+      ${notesExpression},
+      ${invoiceExpression},
+      created_at
+    FROM ${oldTableName}
+  `).run(fallbackUserId);
+
+  db.exec(`DROP TABLE ${oldTableName}`);
+}
+
+function migratePaymentsTable() {
+  const oldTableName = "payments_legacy_multi_user";
+  db.exec(`ALTER TABLE payments RENAME TO ${oldTableName}`);
+  db.exec(`
+    CREATE TABLE payments (
+      id TEXT PRIMARY KEY,
+      invoice_id TEXT NOT NULL,
+      amount REAL NOT NULL,
+      payment_date TEXT NOT NULL,
+      method TEXT NOT NULL DEFAULT '',
+      created_at TEXT NOT NULL,
+      FOREIGN KEY (invoice_id) REFERENCES invoices(id) ON DELETE CASCADE
+    )
+  `);
+
+  db.exec(`
+    INSERT INTO payments (id, invoice_id, amount, payment_date, method, created_at)
+    SELECT id, invoice_id, amount, payment_date, method, created_at
+    FROM ${oldTableName}
+  `);
+
+  db.exec(`DROP TABLE ${oldTableName}`);
+}
+
+function migrateShareLinksTable() {
+  const oldTableName = "invoice_share_links_legacy_multi_user";
+  db.exec(`ALTER TABLE invoice_share_links RENAME TO ${oldTableName}`);
+  db.exec(`
+    CREATE TABLE invoice_share_links (
+      id TEXT PRIMARY KEY,
+      invoice_id TEXT NOT NULL UNIQUE,
+      token TEXT NOT NULL UNIQUE,
+      created_at TEXT NOT NULL,
+      FOREIGN KEY (invoice_id) REFERENCES invoices(id) ON DELETE CASCADE
+    )
+  `);
+
+  db.exec(`
+    INSERT INTO invoice_share_links (id, invoice_id, token, created_at)
+    SELECT id, invoice_id, token, created_at
+    FROM ${oldTableName}
+  `);
+
+  db.exec(`DROP TABLE ${oldTableName}`);
+}
+
+function tableHasColumn(tableName, columnName) {
+  return db.prepare(`PRAGMA table_info(${tableName})`).all().some((column) => column.name === columnName);
+}
+
+function hasCompositeUniqueIndex(tableName, expectedColumns) {
+  const indexes = db.prepare(`PRAGMA index_list(${tableName})`).all();
+
+  return indexes.some((index) => {
+    if (!index.unique) {
+      return false;
+    }
+
+    const columns = db.prepare(`PRAGMA index_info(${index.name})`).all().map((column) => column.name);
+    return columns.length === expectedColumns.length
+      && columns.every((columnName, indexPosition) => columnName === expectedColumns[indexPosition]);
+  });
+}
+
+function foreignKeyTargetsTable(tableName, targetTableName) {
+  return db.prepare(`PRAGMA foreign_key_list(${tableName})`).all().some((foreignKey) => foreignKey.table === targetTableName);
+}
+
 function ensureColumnExists(tableName, columnName, definition) {
   const columns = db.prepare(`PRAGMA table_info(${tableName})`).all();
   if (!columns.some((column) => column.name === columnName)) {
     db.exec(`ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${definition}`);
   }
+}
+
+function backfillOwnership() {
+  const firstUser = db.prepare("SELECT id FROM users ORDER BY created_at ASC LIMIT 1").get();
+
+  if (!firstUser) {
+    return;
+  }
+
+  db.prepare("UPDATE clients SET user_id = ? WHERE user_id IS NULL OR user_id = ''").run(firstUser.id);
+  db.prepare(`
+    UPDATE invoices
+    SET user_id = (
+      SELECT clients.user_id
+      FROM clients
+      WHERE clients.id = invoices.client_id
+    )
+    WHERE user_id IS NULL OR user_id = ''
+  `).run();
+  db.prepare(`
+    UPDATE session_logs
+    SET user_id = (
+      SELECT clients.user_id
+      FROM clients
+      WHERE clients.id = session_logs.client_id
+    )
+    WHERE user_id IS NULL OR user_id = ''
+  `).run();
 }
 
 function calculateInvoiceTotals({ quantity = 1, rate = 0, gstRate = 0, supplyType = "intra" }) {
