@@ -2284,9 +2284,14 @@ function escapePdfText(value) {
 function migrateToMultiUserSchema() {
   const firstUser = db.prepare("SELECT id FROM users ORDER BY created_at ASC LIMIT 1").get();
   const fallbackUserId = firstUser?.id || "";
-  const needsClientsMigration = !tableHasColumn("clients", "user_id") || !hasCompositeUniqueIndex("clients", ["user_id", "code"]);
-  const needsInvoicesMigration = !tableHasColumn("invoices", "user_id") || !hasCompositeUniqueIndex("invoices", ["user_id", "invoice_number"]);
-  const needsSessionLogsMigration = !tableHasColumn("session_logs", "user_id");
+  const needsClientsMigration = !tableHasColumn("clients", "user_id")
+    || !hasCompositeUniqueIndex("clients", ["user_id", "code"]);
+  const needsInvoicesMigration = !tableHasColumn("invoices", "user_id")
+    || !hasCompositeUniqueIndex("invoices", ["user_id", "invoice_number"])
+    || foreignKeyTargetsTable("invoices", "clients_legacy_multi_user");
+  const needsSessionLogsMigration = !tableHasColumn("session_logs", "user_id")
+    || foreignKeyTargetsTable("session_logs", "invoices_legacy_multi_user")
+    || foreignKeyTargetsTable("session_logs", "clients_legacy_multi_user");
   const needsPaymentsMigration = foreignKeyTargetsTable("payments", "invoices_legacy_multi_user");
   const needsShareLinksMigration = foreignKeyTargetsTable("invoice_share_links", "invoices_legacy_multi_user");
 
