@@ -3,6 +3,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const crypto = require("node:crypto");
 const Database = require("better-sqlite3");
+const { OAuth2Client } = require("google-auth-library");
 
 const HOST = process.env.HOST || "0.0.0.0";
 const PORT = Number(process.env.PORT || 3000);
@@ -11,7 +12,9 @@ const DATA_DIR = path.join(__dirname, "data");
 const DB_PATH = path.join(DATA_DIR, "invoiceflow.sqlite");
 const BUSINESS_PROFILE_PATH = path.join(__dirname, "business-profile.json");
 const SESSION_COOKIE = "invoiceflow_session";
+const GOOGLE_CLIENT_ID = String(process.env.GOOGLE_CLIENT_ID || "").trim();
 const BUSINESS_PROFILE = JSON.parse(fs.readFileSync(BUSINESS_PROFILE_PATH, "utf8"));
+const googleClient = GOOGLE_CLIENT_ID ? new OAuth2Client(GOOGLE_CLIENT_ID) : null;
 
 fs.mkdirSync(DATA_DIR, { recursive: true });
 
@@ -116,6 +119,8 @@ migrateToMultiUserSchema();
 ensureColumnExists("clients", "user_id", "TEXT");
 ensureColumnExists("invoices", "user_id", "TEXT");
 ensureColumnExists("session_logs", "user_id", "TEXT");
+ensureColumnExists("users", "google_sub", "TEXT");
+ensureColumnExists("users", "display_name", "TEXT NOT NULL DEFAULT ''");
 ensureColumnExists("clients", "client_type", "TEXT NOT NULL DEFAULT 'therapy'");
 ensureColumnExists("clients", "default_therapy_fee", "REAL NOT NULL DEFAULT 0");
 ensureColumnExists("clients", "default_supervision_fee", "REAL NOT NULL DEFAULT 0");
@@ -141,7 +146,10 @@ backfillOwnership();
 const statements = {
   userCount: db.prepare("SELECT COUNT(*) AS count FROM users"),
   createUser: db.prepare("INSERT INTO users (id, email, password_hash, created_at) VALUES (?, ?, ?, ?)"),
+  createGoogleUser: db.prepare("INSERT INTO users (id, email, password_hash, google_sub, display_name, created_at) VALUES (?, ?, ?, ?, ?, ?)"),
   getUserByEmail: db.prepare("SELECT * FROM users WHERE email = ?"),
+  getUserByGoogleSub: db.prepare("SELECT * FROM users WHERE google_sub = ?"),
+  linkGoogleIdentity: db.prepare("UPDATE users SET google_sub = ?, display_name = ? WHERE id = ?"),
   getUsers: db.prepare("SELECT id, email, created_at FROM users ORDER BY created_at ASC"),
   createSession: db.prepare("INSERT INTO sessions (id, user_id, expires_at, created_at) VALUES (?, ?, ?, ?)"),
   getSessionUser: db.prepare(`
@@ -233,6 +241,13 @@ const statements = {
     INSERT INTO payments (id, invoice_id, amount, payment_date, method, created_at)
     VALUES (?, ?, ?, ?, ?, ?)
   `),
+  getOwnedPaymentById: db.prepare(`
+    SELECT payments.*, invoices.user_id, invoices.invoice_number
+    FROM payments
+    JOIN invoices ON invoices.id = payments.invoice_id
+    WHERE payments.id = ? AND invoices.user_id = ?
+  `),
+  deletePaymentById: db.prepare("DELETE FROM payments WHERE id = ?"),
   createSessionLog: db.prepare(`
     INSERT INTO session_logs (
       id, user_id, client_id, session_type, session_date, duration_minutes, fee_amount, notes, invoice_id, created_at
@@ -253,6 +268,7 @@ const statements = {
     ORDER BY session_date DESC, session_logs.created_at DESC
     LIMIT 12
   `),
+  deleteSessionLog: db.prepare("DELETE FROM session_logs WHERE id = ? AND user_id = ? AND invoice_id IS NULL"),
   getSessionLogsForInvoice: db.prepare(`
     SELECT session_logs.*, clients.name AS client_name
     FROM session_logs
@@ -357,6 +373,20 @@ const statements = {
     VALUES (?, ?, ?, ?)
     ON CONFLICT(invoice_id) DO UPDATE SET token = excluded.token, created_at = excluded.created_at
   `),
+  deleteShareLinkByInvoiceId: db.prepare("DELETE FROM invoice_share_links WHERE invoice_id = ?"),
+  getClientDeleteSummary: db.prepare(`
+    SELECT
+      (SELECT COUNT(*) FROM session_logs WHERE client_id = ? AND user_id = ?) AS session_count,
+      (SELECT COUNT(*) FROM invoices WHERE client_id = ? AND user_id = ?) AS invoice_count
+  `),
+  deleteClientById: db.prepare("DELETE FROM clients WHERE id = ? AND user_id = ?"),
+  getInvoiceDeleteSummary: db.prepare(`
+    SELECT
+      (SELECT COUNT(*) FROM payments WHERE invoice_id = ?) AS payment_count,
+      (SELECT COUNT(*) FROM session_logs WHERE invoice_id = ? AND user_id = ?) AS session_count
+  `),
+  detachSessionsFromInvoice: db.prepare("UPDATE session_logs SET invoice_id = NULL WHERE invoice_id = ? AND user_id = ?"),
+  deleteInvoiceById: db.prepare("DELETE FROM invoices WHERE id = ? AND user_id = ?"),
   getShareLinkByInvoiceId: db.prepare("SELECT * FROM invoice_share_links WHERE invoice_id = ?"),
   getSharedInvoiceByToken: db.prepare(`
     SELECT
@@ -408,12 +438,14 @@ const server = http.createServer(async (req, res) => {
         return redirect(res, "/login");
       }
 
+      const baseUrl = getBaseUrl(req, url);
       return sendHtml(res, 200, renderAuthPage({
         title: "Create Admin Account",
         action: "/setup",
         submitLabel: "Create Account",
         message: "Set up the first login for your invoice platform.",
-        flash
+        flash,
+        googleAuthUrl: GOOGLE_CLIENT_ID ? `${baseUrl}/auth/google` : ""
       }));
     }
 
@@ -444,13 +476,15 @@ const server = http.createServer(async (req, res) => {
         return redirect(res, "/dashboard");
       }
 
+      const baseUrl = getBaseUrl(req, url);
       return sendHtml(res, 200, renderAuthPage({
         title: "Sign In",
         action: "/login",
         submitLabel: "Sign In",
         message: "Access your invoices, reports, and payment tracker.",
         flash,
-        secondaryLink: { href: "/register", label: "Create a new account" }
+        secondaryLink: { href: "/register", label: "Create a new account" },
+        googleAuthUrl: GOOGLE_CLIENT_ID ? `${baseUrl}/auth/google` : ""
       }));
     }
 
@@ -463,13 +497,15 @@ const server = http.createServer(async (req, res) => {
         return redirect(res, "/dashboard");
       }
 
+      const baseUrl = getBaseUrl(req, url);
       return sendHtml(res, 200, renderAuthPage({
         title: "Create Account",
         action: "/register",
         submitLabel: "Create Account",
         message: "Create your own login to manage your own clients, sessions, invoices, and payments.",
         flash,
-        secondaryLink: { href: "/login", label: "Back to sign in" }
+        secondaryLink: { href: "/login", label: "Back to sign in" },
+        googleAuthUrl: GOOGLE_CLIENT_ID ? `${baseUrl}/auth/google` : ""
       }));
     }
 
@@ -509,6 +545,79 @@ const server = http.createServer(async (req, res) => {
 
       statements.createUser.run(randomId(), email, hashPassword(password), isoNow());
       return redirectWithFlash(res, "/dashboard", `Login created for ${email}.`);
+    }
+
+    if (method === "POST" && url.pathname === "/auth/google") {
+      if (!googleClient) {
+        return redirectWithFlash(res, shouldShowSetup() ? "/setup" : "/login", "Google sign-in is not configured yet.");
+      }
+
+      const form = await parseForm(req);
+      const csrfCookie = parseCookies(req.headers.cookie || "").g_csrf_token;
+      const csrfBody = String(form.g_csrf_token || "");
+      const credential = String(form.credential || "");
+
+      if (!csrfCookie || !csrfBody || csrfCookie !== csrfBody) {
+        return redirectWithFlash(res, shouldShowSetup() ? "/setup" : "/login", "Google sign-in could not be verified. Please try again.");
+      }
+
+      if (!credential) {
+        return redirectWithFlash(res, shouldShowSetup() ? "/setup" : "/login", "Google sign-in did not return a valid credential.");
+      }
+
+      let googleProfile;
+      try {
+        googleProfile = await verifyGoogleCredential(credential);
+      } catch (error) {
+        return redirectWithFlash(res, shouldShowSetup() ? "/setup" : "/login", "Google sign-in failed verification. Check your Google client setup and try again.");
+      }
+
+      if (!googleProfile.email || !googleProfile.emailVerified) {
+        return redirectWithFlash(res, shouldShowSetup() ? "/setup" : "/login", "Your Google account email could not be verified.");
+      }
+
+      let foundUser = statements.getUserByGoogleSub.get(googleProfile.sub);
+
+      if (!foundUser) {
+        const existingUser = statements.getUserByEmail.get(googleProfile.email);
+
+        if (existingUser && existingUser.google_sub && existingUser.google_sub !== googleProfile.sub) {
+          return redirectWithFlash(res, "/login", "That email address is already linked to a different Google account.");
+        }
+
+        if (existingUser) {
+          statements.linkGoogleIdentity.run(googleProfile.sub, googleProfile.name, existingUser.id);
+          foundUser = {
+            ...existingUser,
+            google_sub: googleProfile.sub,
+            display_name: googleProfile.name
+          };
+        } else {
+          const userId = randomId();
+          statements.createGoogleUser.run(
+            userId,
+            googleProfile.email,
+            hashPassword(randomId()),
+            googleProfile.sub,
+            googleProfile.name,
+            isoNow()
+          );
+          foundUser = statements.getUserByEmail.get(googleProfile.email);
+        }
+      }
+
+      const sessionId = randomId();
+      const expiresAt = new Date(Date.now() + 1000 * 60 * 60 * 24 * 7).toISOString();
+      statements.createSession.run(sessionId, foundUser.id, expiresAt, isoNow());
+
+      res.setHeader("Set-Cookie", serializeCookie(SESSION_COOKIE, sessionId, {
+        httpOnly: true,
+        sameSite: "Lax",
+        path: "/",
+        maxAge: 60 * 60 * 24 * 7
+      }));
+
+      return redirect(res, "/dashboard");
     }
 
     if (method === "POST" && url.pathname === "/login") {
@@ -837,6 +946,18 @@ const server = http.createServer(async (req, res) => {
       return redirectWithFlash(res, "/dashboard", `Payment recorded for ${invoice.invoice_number}.`);
     }
 
+    if (method === "POST" && url.pathname.startsWith("/payments/") && url.pathname.endsWith("/delete")) {
+      const paymentId = url.pathname.split("/")[2];
+      const payment = statements.getOwnedPaymentById.get(paymentId, user.id);
+
+      if (!payment) {
+        return redirectWithFlash(res, "/dashboard", "Payment not found.");
+      }
+
+      statements.deletePaymentById.run(payment.id);
+      return redirectWithFlash(res, "/dashboard", `Payment removed from ${payment.invoice_number}.`);
+    }
+
     if (method === "POST" && url.pathname.startsWith("/invoices/") && url.pathname.endsWith("/share")) {
       const invoiceId = url.pathname.split("/")[2];
       const invoice = statements.getInvoiceById.get(invoiceId, user.id);
@@ -848,6 +969,60 @@ const server = http.createServer(async (req, res) => {
       const token = crypto.randomBytes(18).toString("base64url");
       statements.upsertShareLink.run(randomId(), invoiceId, token, isoNow());
       return redirectWithFlash(res, "/dashboard", `Share link created for ${invoice.invoice_number}.`);
+    }
+
+    if (method === "POST" && url.pathname.startsWith("/invoices/") && url.pathname.endsWith("/delete")) {
+      const invoiceId = url.pathname.split("/")[2];
+      const invoice = statements.getInvoiceById.get(invoiceId, user.id);
+
+      if (!invoice) {
+        return redirectWithFlash(res, "/dashboard", "Invoice not found.");
+      }
+
+      const deletionSummary = statements.getInvoiceDeleteSummary.get(invoice.id, invoice.id, user.id);
+
+      if ((deletionSummary?.payment_count || 0) > 0) {
+        return redirectWithFlash(res, "/dashboard", "Delete recorded payments first before deleting this invoice.");
+      }
+
+      statements.detachSessionsFromInvoice.run(invoice.id, user.id);
+      statements.deleteShareLinkByInvoiceId.run(invoice.id);
+      statements.deleteInvoiceById.run(invoice.id, user.id);
+      return redirectWithFlash(res, "/dashboard", `Invoice ${invoice.invoice_number} deleted.`);
+    }
+
+    if (method === "POST" && url.pathname.startsWith("/sessions/") && url.pathname.endsWith("/delete")) {
+      const sessionId = url.pathname.split("/")[2];
+      const sessionLog = statements.getSessionById.get(sessionId, user.id);
+
+      if (!sessionLog) {
+        return redirectWithFlash(res, "/dashboard", "Session not found.");
+      }
+
+      if (sessionLog.invoice_id) {
+        return redirectWithFlash(res, "/dashboard", "This session is already invoiced. Delete the invoice first if you need to remove it.");
+      }
+
+      statements.deleteSessionLog.run(sessionId, user.id);
+      return redirectWithFlash(res, "/dashboard", "Session deleted.");
+    }
+
+    if (method === "POST" && url.pathname.startsWith("/clients/") && url.pathname.endsWith("/delete")) {
+      const clientId = url.pathname.split("/")[2];
+      const client = statements.getClientById.get(clientId, user.id);
+
+      if (!client) {
+        return redirectWithFlash(res, "/dashboard", "Client not found.");
+      }
+
+      const deletionSummary = statements.getClientDeleteSummary.get(client.id, user.id, client.id, user.id);
+
+      if ((deletionSummary?.session_count || 0) > 0 || (deletionSummary?.invoice_count || 0) > 0) {
+        return redirectWithFlash(res, "/dashboard", "Delete this client's sessions and invoices first before removing the client.");
+      }
+
+      statements.deleteClientById.run(client.id, user.id);
+      return redirectWithFlash(res, "/dashboard", `Client ${client.name} deleted.`);
     }
 
     if (method === "GET" && url.pathname.startsWith("/invoices/") && url.pathname.endsWith("/pdf")) {
@@ -1183,13 +1358,14 @@ function renderDashboard({ flash, userId, userEmail, selectedMonth, selectedInvo
                     <th>Open</th>
                     <th>Share</th>
                     <th>Print</th>
+                    <th>Delete</th>
                   </tr>
                 </thead>
                 <tbody>
                   ${
                     invoices.length
                       ? invoices.map(renderInvoiceRow).join("")
-                      : `<tr><td colspan="13">${renderEmptyState("No invoices yet.")}</td></tr>`
+                      : `<tr><td colspan="14">${renderEmptyState("No invoices yet.")}</td></tr>`
                   }
                 </tbody>
               </table>
@@ -1290,13 +1466,14 @@ function renderDashboard({ flash, userId, userEmail, selectedMonth, selectedInvo
                     <th>Invoice</th>
                     <th>Method</th>
                     <th>Amount</th>
+                    <th>Delete</th>
                   </tr>
                 </thead>
                 <tbody>
                   ${
                     recentPayments.length
                       ? recentPayments.map(renderPaymentRow).join("")
-                      : `<tr><td colspan="5">${renderEmptyState("No payments recorded yet.")}</td></tr>`
+                      : `<tr><td colspan="6">${renderEmptyState("No payments recorded yet.")}</td></tr>`
                   }
                 </tbody>
               </table>
@@ -1308,11 +1485,13 @@ function renderDashboard({ flash, userId, userEmail, selectedMonth, selectedInvo
   });
 }
 
-function renderAuthPage({ title, action, submitLabel, message, flash, secondaryLink }) {
+function renderAuthPage({ title, action, submitLabel, message, flash, secondaryLink, googleAuthUrl }) {
+  const showGoogleAuth = GOOGLE_CLIENT_ID && googleAuthUrl;
   return renderLayout({
     title,
     bodyClass: "auth-body",
     content: `
+      ${showGoogleAuth ? `<script src="https://accounts.google.com/gsi/client" async defer></script>` : ""}
       <main class="auth-shell">
         <section class="auth-card">
           <p class="eyebrow">InvoiceFlow Platform</p>
@@ -1330,6 +1509,24 @@ function renderAuthPage({ title, action, submitLabel, message, flash, secondaryL
             </label>
             <button class="primary-button" type="submit">${escapeHtml(submitLabel)}</button>
           </form>
+          ${showGoogleAuth ? `
+            <div class="auth-divider"><span>or</span></div>
+            <div id="g_id_onload"
+              data-client_id="${escapeHtml(GOOGLE_CLIENT_ID)}"
+              data-login_uri="${escapeHtml(googleAuthUrl)}"
+              data-ux_mode="redirect"
+              data-auto_prompt="false"></div>
+            <div class="google-signin-wrap">
+              <div class="g_id_signin"
+                data-type="standard"
+                data-shape="pill"
+                data-theme="outline"
+                data-text="continue_with"
+                data-size="large"
+                data-width="320"></div>
+            </div>
+            <p class="hero-copy auth-note">Use your Google account to create or access the same practice workspace for that email address.</p>
+          ` : ""}
           ${secondaryLink ? `<p class="hero-copy"><a href="${secondaryLink.href}">${escapeHtml(secondaryLink.label)}</a></p>` : ""}
         </section>
       </main>
@@ -1448,6 +1645,9 @@ function renderLayout({ title, content, bodyClass }) {
 
 function renderClientCard(client) {
   const outstanding = getClientOutstanding(client.id, client.user_id);
+  const deletionLabel = outstanding > 0.001
+    ? "Delete unavailable while outstanding remains"
+    : "Delete client";
   return `
     <article class="client-item">
       <strong>${escapeHtml(client.name)}</strong>
@@ -1463,6 +1663,9 @@ function renderClientCard(client) {
         <span>${countClientInvoices(client.id, client.user_id)} invoice(s)</span>
         <span>${formatCurrency(outstanding)} outstanding</span>
       </div>
+      <form action="/clients/${client.id}/delete" method="post" class="inline-form danger-form">
+        <button class="table-button danger-button" type="submit" title="${escapeHtml(deletionLabel)}">Delete</button>
+      </form>
     </article>
   `;
 }
@@ -1494,6 +1697,11 @@ function renderInvoiceRow(invoice) {
         ${publicUrl ? `<a class="share-link" href="${publicUrl}" target="_blank" rel="noreferrer">${escapeHtml(publicUrl)}</a>` : ""}
       </td>
       <td><a class="table-button anchor-button" href="/invoices/${invoice.id}/view" target="_blank" rel="noreferrer">Print</a></td>
+      <td>
+        <form action="/invoices/${invoice.id}/delete" method="post" class="inline-form danger-form">
+          <button class="table-button danger-button" type="submit">Delete</button>
+        </form>
+      </td>
     </tr>
   `;
 }
@@ -1507,7 +1715,14 @@ function renderSessionRow(sessionLog) {
       <td>${escapeHtml(`${sessionLog.duration_minutes} min`)}</td>
       <td>${formatCurrency(sessionLog.fee_amount)}</td>
       <td>${sessionLog.invoice_id ? "Invoiced" : "Open"}</td>
-      <td>${sessionLog.invoice_id ? `<span class="invoice-meta">Locked</span>` : `<a class="table-button anchor-button" href="/sessions/${sessionLog.id}/edit">Edit</a>`}</td>
+      <td>${sessionLog.invoice_id ? `<span class="invoice-meta">Locked</span>` : `
+        <div class="action-row">
+          <a class="table-button anchor-button" href="/sessions/${sessionLog.id}/edit">Edit</a>
+          <form action="/sessions/${sessionLog.id}/delete" method="post" class="inline-form danger-form">
+            <button class="table-button danger-button" type="submit">Delete</button>
+          </form>
+        </div>
+      `}</td>
       <td>${escapeHtml(sessionLog.notes || "No notes")}</td>
     </tr>
   `;
@@ -1553,6 +1768,11 @@ function renderPaymentRow(payment) {
       <td>${escapeHtml(payment.invoice_number)}</td>
       <td>${escapeHtml(payment.method || "Payment recorded")}</td>
       <td>${formatCurrency(payment.amount)}</td>
+      <td>
+        <form action="/payments/${payment.id}/delete" method="post" class="inline-form danger-form">
+          <button class="table-button danger-button" type="submit">Delete</button>
+        </form>
+      </td>
     </tr>
   `;
 }
@@ -1816,6 +2036,13 @@ function getSessionUser(sessionId) {
   };
 }
 
+function getBaseUrl(req, url) {
+  const forwardedProto = String(req.headers["x-forwarded-proto"] || "").split(",")[0].trim();
+  const protocol = forwardedProto || url.protocol.replace(":", "");
+  const host = req.headers["x-forwarded-host"] || req.headers.host || `${HOST}:${PORT}`;
+  return `${protocol}://${host}`;
+}
+
 function parseCookies(cookieHeader) {
   return cookieHeader.split(";").reduce((accumulator, pair) => {
     const [key, ...rest] = pair.trim().split("=");
@@ -1910,6 +2137,25 @@ function hashPassword(password) {
   const salt = crypto.randomBytes(16).toString("hex");
   const hash = crypto.scryptSync(password, salt, 64).toString("hex");
   return `${salt}:${hash}`;
+}
+
+async function verifyGoogleCredential(credential) {
+  const ticket = await googleClient.verifyIdToken({
+    idToken: credential,
+    audience: GOOGLE_CLIENT_ID
+  });
+  const payload = ticket.getPayload();
+
+  if (!payload?.sub || !payload?.email) {
+    throw new Error("Google credential payload was incomplete.");
+  }
+
+  return {
+    sub: payload.sub,
+    email: String(payload.email).trim().toLowerCase(),
+    emailVerified: Boolean(payload.email_verified),
+    name: String(payload.name || payload.email || "Google user").trim()
+  };
 }
 
 function verifyPassword(password, stored) {

@@ -280,6 +280,11 @@ button,
   background: rgba(241, 184, 91, 0.2);
 }
 
+.danger-button {
+  color: #fff5f2;
+  background: linear-gradient(135deg, var(--danger) 0%, #c65d3d 100%);
+}
+
 button:disabled {
   opacity: 0.5;
   cursor: not-allowed;
@@ -389,6 +394,40 @@ th {
 
 .inline-form {
   display: inline;
+}
+
+.danger-form {
+  margin: 0;
+}
+
+.action-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.auth-divider {
+  display: grid;
+  place-items: center;
+  margin: 18px 0 14px;
+  color: var(--muted);
+  font-size: 0.9rem;
+  font-weight: 700;
+}
+
+.auth-divider span {
+  padding: 0 12px;
+  background: rgba(255, 255, 255, 0.8);
+  border-radius: 999px;
+}
+
+.google-signin-wrap {
+  display: grid;
+  justify-content: center;
+}
+
+.auth-note {
+  text-align: center;
 }
 
 .table-button {
